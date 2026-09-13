@@ -14,6 +14,30 @@ def format_plan_amt(amt: float) -> str:
         return str(int(round(amt)))
     return f"{amt:.2f}"
 
+def add_months(date_value, months: int):
+    month_index = date_value.year * 12 + date_value.month - 1 + months
+    year, month_index = divmod(month_index, 12)
+    month = month_index + 1
+    day = min(date_value.day, calendar.monthrange(year, month)[1])
+    return date_value.replace(year=year, month=month, day=day)
+
+def select_request_messages(messages_by_user: dict, user_id: str, request_id: str) -> dict:
+    messages = messages_by_user.get(user_id, [])
+    if isinstance(messages, dict):
+        return messages
+
+    relevant = [message for message in messages
+                if message.get('request_id') in (None, request_id)]
+    relevant.sort(key=lambda message: str(message.get('sent_at', '')))
+    merged = {}
+    for message in relevant:
+        for key, value in message.items():
+            if key in {'user_id', 'request_id', 'related_event_id', 'sent_at'}:
+                continue
+            if value is not None and value is not False:
+                merged[key] = value
+    return merged
+
 def solve_financial_request(req_row: pd.Series, events_df: pd.DataFrame, 
                             profiles_df: pd.DataFrame, options_df: pd.DataFrame, 
                             rates_df: pd.DataFrame, messages_by_user: dict) -> dict:
@@ -41,8 +65,10 @@ def solve_financial_request(req_row: pd.Series, events_df: pd.DataFrame,
     willing_red_cats = set(str(prof.get('expense_categories_user_is_willing_to_reduce', '')).split('|'))
     protect_cats = set(str(prof.get('expense_categories_to_protect', '')).split('|'))
 
+    request_messages = select_request_messages(messages_by_user, user_id, req_id)
+
     # 1. Baseline 90-day simulation
-    sim_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, messages_by_user)
+    sim_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, {user_id: request_messages})
     daily_balances = sim_res['daily_balances']
     base_sal_day = sim_res['base_sal_day']
     fixed_streams = sim_res['fixed_streams']
@@ -58,19 +84,17 @@ def solve_financial_request(req_row: pd.Series, events_df: pd.DataFrame,
     if amount_safe_to_pay >= req_amt:
         earliest_date_for_full = req_date_str
     else:
-        # Check upcoming paydays and dates
+        # Find the first date on which a full payment remains safe for the rest
+        # of the forecast, including confirmed future income and expenses.
         for d in range(1, FORECAST_DAYS):
             test_dt = req_date + timedelta(days=d)
-            if not emp_ended and test_dt.day == base_sal_day:
-                is_safe = True
-                for fut_d in range(d, min(d + 35, FORECAST_DAYS)):
-                    fut_dt = req_date + timedelta(days=fut_d)
-                    if daily_balances[fut_dt] - req_amt < min_bal - 0.05:
-                        is_safe = False
-                        break
-                if is_safe:
-                    earliest_date_for_full = str(test_dt)
-                    break
+            is_safe = all(
+                daily_balances[req_date + timedelta(days=fut_d)] - req_amt >= min_bal - 0.05
+                for fut_d in range(d, FORECAST_DAYS)
+            )
+            if is_safe:
+                earliest_date_for_full = str(test_dt)
+                break
 
     candidates = []
 
@@ -96,13 +120,16 @@ def solve_financial_request(req_row: pd.Series, events_df: pd.DataFrame,
                           (options_df['payment_method'] == 'installments')]
         for _, opt in opts.iterrows():
             n_payments = int(opt['number_of_payments'])
-            if n_payments > max_inst_months:
-                continue
-
             p_amt = float(opt['payment_amount'])
             freq = int(opt['payment_frequency_days'])
             first_dt = datetime.strptime(opt['first_payment_date'], '%Y-%m-%d').date()
             tot_amt = float(opt['total_payable_amount'])
+
+            if first_dt < req_date:
+                continue
+            last_dt = first_dt + timedelta(days=(n_payments - 1) * freq)
+            if last_dt > add_months(first_dt, int(max_inst_months)):
+                continue
 
             pay_dates = [first_dt + timedelta(days=i * freq) for i in range(n_payments)]
             completes_on_time = pay_dates[-1] <= comp_date
@@ -172,7 +199,7 @@ def solve_financial_request(req_row: pd.Series, events_df: pd.DataFrame,
         # Try 1 stop
         for sc in stoppable_candidates:
             change = [f"stop:{sc['event_id']}"]
-            b_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, messages_by_user, spending_changes=change)
+            b_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, {user_id: request_messages}, spending_changes=change)
             min_b = min(b_res['daily_balances'][req_date + timedelta(days=d)] for d in range(FORECAST_DAYS))
             if min_b - min_bal >= req_amt - 1e-4:
                 best_change_combo = change
@@ -183,7 +210,7 @@ def solve_financial_request(req_row: pd.Series, events_df: pd.DataFrame,
             for rc in reducible_candidates:
                 if rc['min_allowed'] is not None:
                     change = [f"reduce_to:{rc['event_id']}:{format_plan_amt(rc['min_allowed'])}"]
-                    b_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, messages_by_user, spending_changes=change)
+                    b_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, {user_id: request_messages}, spending_changes=change)
                     min_b = min(b_res['daily_balances'][req_date + timedelta(days=d)] for d in range(FORECAST_DAYS))
                     if min_b - min_bal >= req_amt - 1e-4:
                         best_change_combo = change
@@ -196,7 +223,7 @@ def solve_financial_request(req_row: pd.Series, events_df: pd.DataFrame,
                     if sc['event_id'] == rc['event_id'] or rc['min_allowed'] is None:
                         continue
                     change = [f"stop:{sc['event_id']}", f"reduce_to:{rc['event_id']}:{format_plan_amt(rc['min_allowed'])}"]
-                    b_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, messages_by_user, spending_changes=change)
+                    b_res = simulate_daily_balances(user_id, req_date_str, events_df, profiles_df, rates_df, {user_id: request_messages}, spending_changes=change)
                     min_b = min(b_res['daily_balances'][req_date + timedelta(days=d)] for d in range(FORECAST_DAYS))
                     if min_b - min_bal >= req_amt - 1e-4:
                         best_change_combo = change

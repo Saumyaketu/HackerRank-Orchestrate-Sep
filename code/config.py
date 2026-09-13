@@ -39,3 +39,7 @@ CURRENCIES = ["INR", "ZAR", "IDR", "USD", "EUR"]
 
 # 90-day forecast horizon
 FORECAST_DAYS = 90
+
+# Local Model Configuration (Ollama / LLaVA / Llama)
+DEFAULT_LOCAL_MODEL = os.environ.get("LOCAL_MODEL_NAME", "llava")
+OLLAMA_API_BASE = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
